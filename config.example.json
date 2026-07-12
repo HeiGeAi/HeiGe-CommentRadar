@@ -1,0 +1,65 @@
+{
+  "_说明": "复制本文件为 config.json 再改。最小可用配置只需要 creators 里填博主；storage 默认 local(本地 JSONL+CSV)，绑定飞书跑 node init-feishu-base.mjs 会自动切到 feishu 模式。",
+  "storage": {
+    "mode": "local"
+  },
+  "base": {
+    "_说明": "飞书多维表格配置：不用手填，node init-feishu-base.mjs 一键建库后自动写入",
+    "baseToken": "",
+    "url": "",
+    "tables": {}
+  },
+  "collectors": {
+    "_说明": "默认用内置 DOM 采集器，零配置。若你有自己的浏览器插件类采集脚本，可在 meixun.platforms 按平台配 userVideoScript/commentScript 路径(相对本目录或绝对路径)作为增强模式",
+    "meixun": {}
+  },
+  "creators": [
+    {
+      "_说明": "B站示例(游客模式即可采，下载后第一条跑通就靠它)；profileUrl 用空间投稿页 /video",
+      "name": "央视新闻",
+      "platform": "bilibili",
+      "profileUrl": "https://space.bilibili.com/456664753/video",
+      "enabled": true
+    },
+    {
+      "_说明": "小红书示例：profileUrl 填博主主页链接(浏览器地址栏复制)，需要先 ./run.sh --login-setup 扫码登录",
+      "name": "示例小红书博主",
+      "platform": "xiaohongshu",
+      "profileUrl": "https://www.xiaohongshu.com/user/profile/在这里填博主ID",
+      "enabled": false
+    },
+    {
+      "_说明": "抖音示例：profileUrl 填博主主页链接，需要先 ./run.sh --login-setup --platform=douyin 扫码登录",
+      "name": "示例抖音博主",
+      "platform": "douyin",
+      "profileUrl": "https://www.douyin.com/user/在这里填sec_uid",
+      "enabled": false
+    }
+  ],
+  "runtime": {
+    "profileDir": ".runtime/chrome-profile",
+    "maxCreatorNotes": 5,
+    "maxCommentsPerVideo": 30,
+    "topCommentsPerVideo": 10,
+    "maxNewVideosPerCreator": 1,
+    "maxVideosPerRun": 14,
+    "includeAllNoteTypes": true,
+    "fetchNoteDetail": false,
+    "screenshots": true,
+    "headless": false,
+    "closeExistingProfileBeforeRun": true,
+    "navigationTimeoutMs": 45000,
+    "collectionTimeoutMs": 180000,
+    "commentTimeoutMs": 180000,
+    "detailDelayMs": 12000,
+    "delays": {
+      "loginCheckSettleMs": [12000, 20000],
+      "startupMs": [60000, 120000],
+      "profilePageSettleMs": [25000, 45000],
+      "notePageSettleMs": [25000, 45000],
+      "beforeCommentMs": [120000, 240000],
+      "betweenVideosMs": [240000, 480000],
+      "betweenCreatorsMs": [300000, 600000]
+    }
+  }
+}

@@ -1,0 +1,11 @@
+# 本地配置（含你自己的博主清单和飞书 token），仓库里只放 config.example.json
+config.json
+
+# 运行产物：登录态 Chrome profile、采集数据、截图、锁文件
+.runtime/
+
+# 依赖
+node_modules/
+
+# 系统文件
+.DS_Store

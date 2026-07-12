@@ -1,0 +1,17 @@
+{
+  "name": "heige-comment-radar",
+  "version": "1.0.0",
+  "description": "多平台博主评论监控雷达：小红书/抖音/B站新内容+热门评论+截图，沉淀成你的选题素材库（本地文件或飞书多维表格）",
+  "type": "module",
+  "license": "PolyForm-Noncommercial-1.0.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/HeiGeAi/HeiGe-CommentRadar.git"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "dependencies": {
+    "playwright": "1.60.0"
+  }
+}
