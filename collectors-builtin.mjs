@@ -172,11 +172,25 @@ const PARSE_CONTAINER = (node) => {
     }
     return out;
   };
-  const looksLikeCss = (l) => /[{};]/.test(l) && /:/.test(l);
+  // 只过滤真正像 CSS 的行(含花括号/分号且以 } 或 ; 收尾)，别误伤「我觉得{这样}好：对」这类正文
+  const looksLikeCss = (l) => /[{};]/.test(l) && /:/.test(l) && /[};]\s*$/.test(l);
   const lines = deepText(node).split('\n').map((l) => l.replace(/\s+/g, ' ').trim()).filter(Boolean).filter((l) => !looksLikeCss(l));
   if (lines.length === 0) return null;
-  const isTime = (l) => /^\d{4}[-年.]\d{1,2}[-月.]\d{1,2}|^\d{1,2}[-月.]\d{1,2}(?![\d])|^(刚刚|昨天|前天|今天)|^\d+\s*(秒|分钟|小时|天|周|个月|年)前/.test(l);
-  const isCount = (l) => /^\d+(\.\d+)?\s*[万wk]?$/i.test(l) || /^(赞|回复|点赞)$/.test(l);
+  // 时间行判定收紧，避免把正文("9.9包邮""今天学到了""5.20我爱你")误判成时间边界导致评论被截断/丢弃：
+  //   ①完整日期 2025-10-10 / 2025年10月10（低误判，覆盖已验证的小红书/B站）
+  //   ②N分钟前/N小时前 等相对时间(带「前」很少歧义)
+  //   ③刚刚/今天/昨天/前天 只在其后是空白/数字/行尾时算(排除「今天学到了」)，且整行短
+  //   ④短日期 M-D / M月D 只认「-」「月」分隔(排除 9.9/5.20/8.5 这类用「.」的价格/评分)，整行短
+  const isTime = (l) => {
+    if (/^\d{4}[-年.]\d{1,2}[-月.]\d{1,2}/.test(l)) return true;
+    if (/^\d+\s*(秒|分钟|小时|天|周|个月|年)前/.test(l)) return true;
+    if (l.length <= 10 && /^(刚刚|今天|昨天|前天)([\s\d]|$)/.test(l)) return true;
+    if (l.length <= 12 && /^\d{1,2}[-月]\d{1,2}(?![\d])/.test(l)) return true;
+    return false;
+  };
+  // 尾部动作词(赞/回复/点赞/分享…)：从 content 里剔除但不当 likes；点赞数值只在时间行之后取
+  const isActionWord = (l) => /^(赞|点赞|回复|分享|举报|收起|翻译)$/.test(l);
+  const isNumeric = (l) => /^\d+(\.\d+)?\s*[万wk]?$/i.test(l);
   const author = lines[0];
   let content = [];
   let publishTime = '';
@@ -184,17 +198,16 @@ const PARSE_CONTAINER = (node) => {
   for (let i = 1; i < lines.length; i += 1) {
     const line = lines[i];
     if (isTime(line)) { publishTime = line.split(' ')[0]; break; } // 时间行=顶层评论结束
-    if (isCount(line)) { if (likes === null && /^\d/.test(line)) likes = line; continue; }
+    if (isActionWord(line)) continue;
     if (line === author) continue;
+    // 时间行之前的纯数字行是评论正文(如「666」「233」)，保留进 content；点赞数在时间行之后取
     content.push(line);
   }
-  if (likes === null) {
-    // 点赞数常在时间行之后紧跟：往后再看几行
-    const timeIdx = lines.findIndex((l, i) => i > 0 && isTime(l));
-    if (timeIdx > 0) {
-      for (const line of lines.slice(timeIdx + 1, timeIdx + 4)) {
-        if (/^\d+(\.\d+)?\s*[万wk]?$/i.test(line)) { likes = line; break; }
-      }
+  // 点赞数在动作栏(时间行之后)，取时间行后的第一个数字行；避免把正文里的数字当点赞
+  const timeIdx = lines.findIndex((l, i) => i > 0 && isTime(l));
+  if (timeIdx > 0) {
+    for (const line of lines.slice(timeIdx + 1, timeIdx + 5)) {
+      if (isNumeric(line)) { likes = line; break; }
     }
   }
   const text = content.join(' ').trim();
@@ -260,12 +273,11 @@ export async function builtinComments(page, platform, maxCount) {
     if (noMove >= 2) break;
     await sleep(1600);
   }
-  // 逐容器解析
-  let containerSelector = selectors[0];
-  let containers = page.locator(containerSelector);
-  if ((await containers.count().catch(() => 0)) === 0 && selectors[1]) {
-    containerSelector = selectors[1];
-    containers = page.locator(containerSelector);
+  // 逐容器解析：按候选选择器依次回退，取第一个命中的(不止试前两个)
+  let containers = page.locator(selectors[0]);
+  for (const sel of selectors) {
+    const loc = page.locator(sel);
+    if ((await loc.count().catch(() => 0)) > 0) { containers = loc; break; }
   }
   const total = Math.min(await containers.count().catch(() => 0), maxCount);
   const records = [];
@@ -276,7 +288,7 @@ export async function builtinComments(page, platform, maxCount) {
     const parsed = await handle.evaluate(PARSE_CONTAINER).catch(() => null);
     await handle.dispose().catch(() => {});
     if (!parsed) continue;
-    const key = `${parsed.author}|${parsed.content.slice(0, 60)}`;
+    const key = `${parsed.author}|${parsed.content}`; // 用完整正文，别截断到60字(同作者不同长评论会误判重复)
     if (seen.has(key)) continue;
     seen.add(key);
     records.push({

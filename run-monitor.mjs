@@ -247,8 +247,13 @@ function acquireRunLock() {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      const lock = readRunLock();
-      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid && processExists(lock.pid)) {
+      // 读锁判活。半写文件(刚 wx 创建还没写内容)会 parse 成 null，短暂重读几次，
+      // 别把正在写的活锁误删导致两个进程同时拿锁(TOCTOU)
+      let lock = readRunLock();
+      for (let r = 0; r < 3 && lock === null; r += 1) { sleepSync(150); lock = readRunLock(); }
+      const ageMs = lock && lock.startedAt ? (Date.now() - Date.parse(String(lock.startedAt).replace(' ', 'T'))) : 0;
+      const tooOld = ageMs > 24 * 3600 * 1000; // 超 24h 视为残锁(PID 可能已被系统复用)，避免永久静默空跑
+      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid && processExists(lock.pid) && !tooOld) {
         const lockErr = new Error(`已有监控任务在运行。pid=${lock.pid} startedAt=${lock.startedAt}。请等待当前任务结束后再重试，避免抢占同一 Chrome profile。`);
         lockErr.code = 'RUN_LOCK_HELD';
         throw lockErr;
@@ -569,7 +574,14 @@ async function loginStateFromPage(page, p) {
     }
   }
   const text = await page.locator('body').innerText({ timeout: 10000 }).catch(() => '');
-  const loggedOut = cookieLoggedIn !== null ? !cookieLoggedIn : adapter.loginCheckWall.test(text);
+  let loggedOut;
+  if (cookieLoggedIn !== null) {
+    loggedOut = !cookieLoggedIn;
+  } else if (!text || text.trim().length < 30) {
+    loggedOut = true; // 无 cookie 判据的平台(小红书)页面没渲染出来时保守判未登录，别 fail-open 假定已登录
+  } else {
+    loggedOut = adapter.loginCheckWall.test(text);
+  }
   return { loggedOut, cookieLoggedIn, text: cleanText(text, 300), url: page.url() };
 }
 
@@ -794,7 +806,7 @@ async function collectNoteComments(context, video, selectTopItems) {
         const d = document.querySelector('[data-e2e="video-desc"], h1, [class*="video-info"] [class*="title"]');
         return ((d && d.innerText) || document.title || '').replace(/\s+/g, ' ').trim();
       }).catch(() => '');
-      if (vt) video.title = vt.replace(/\s*[-|]\s*(抖音|哔哩哔哩).*$/, '').slice(0, 200);
+      if (vt) video.title = vt.replace(/\s*[-|_]\s*(抖音|哔哩哔哩|bilibili).*$/i, '').slice(0, 200);
     }
     let records;
     if (!scripts) {
@@ -857,8 +869,9 @@ function videoRows(videos) {
   const fields = ['平台', '标题', '博主', '视频链接', '笔记 ID', '发布时间', '点赞数', '收藏数', '评论数', '正文', '标签', '封面', '媒体地址', '首次发现时间', '运行批次', '唯一键'];
   const rows = videos.map((video) => {
     const plat = video.platform || 'xiaohongshu';
-    const douyinNoStat = plat === 'douyin'; // 抖音直抓 DOM 拿不到点赞/收藏/评论数，写 null 而非假 0
-    const biliComments = plat === 'bilibili'; // B站 comments 字段实为弹幕数非评论数，置空免污染横向比较
+    // 采集不到的互动数一律保留 null，不伪造成真实 0(采集器已把抓不到的置 null)：
+    // 抖音直抓列表拿不到赞/藏/评论数；B站列表卡片给的是弹幕数非评论数，也置 null
+    const num = (v) => (v == null ? null : numberValue(v));
     return [
       (PLATFORM[plat] || PLATFORM.xiaohongshu).label,
       cleanText(video.title, 200) || '无标题',
@@ -866,9 +879,9 @@ function videoRows(videos) {
       video.url,
       video.noteId,
       video.publishTime || null,
-      douyinNoStat ? null : numberValue(video.likes),
-      douyinNoStat ? null : numberValue(video.collects),
-      (douyinNoStat || biliComments) ? null : numberValue(video.comments),
+      num(video.likes),
+      num(video.collects),
+      num(video.comments),
       cleanText(video.content, 2000),
       cleanText(video.tags, 500),
       video.coverUrl || '',
@@ -1001,19 +1014,33 @@ async function main() {
       }, null, 2));
       return;
     }
-    const loginState = await waitForLogin(loginPage, loginPlatform);
-    await loginPage.close().catch(() => {});
+    // --login-check：按用户 --platform 指定的平台查登录态，打印后返回
     if (loginCheck) {
+      const loginState = await waitForLogin(loginPage, loginPlatform);
+      await loginPage.close().catch(() => {});
       writeLoginStatus(loginPlatform, !loginState.loggedOut);
       console.log(JSON.stringify({ loginState, profileDir, storage: storage.describe() }, null, 2));
       return;
     }
+    // 正式采集：小红书靠页面文案判登录，抖音/B站靠 per-creator cookie 检查(在 scrapeCreatorNotesOnce 里)。
+    // 登录预检只在有小红书博主时做，否则纯 B站/抖音的 L0 下载即用无需依赖小红书可达(打不开小红书不该连累整轮)
     const hasXhsCreator = targetCreators.some((c) => (c.platform || 'xiaohongshu') === 'xiaohongshu');
-    if (loginState.loggedOut && hasXhsCreator) {
-      throw new Error(`小红书未登录。请先 ./run.sh --login-setup 登录，再重新运行。profileDir=${profileDir}`);
-    }
-    if (loginState.loggedOut) {
-      console.log('[登录] 小红书未登录，但本轮无小红书博主，继续其它平台');
+    if (hasXhsCreator) {
+      let loginState;
+      try {
+        loginState = await waitForLogin(loginPage, 'xiaohongshu');
+      } catch (error) {
+        await loginPage.close().catch(() => {});
+        throw new Error(`小红书登录预检失败(打不开小红书)：${String(error.message).split('\n')[0]}`);
+      }
+      await loginPage.close().catch(() => {});
+      writeLoginStatus('xiaohongshu', !loginState.loggedOut);
+      if (loginState.loggedOut) {
+        throw new Error(`小红书未登录。请先 ./run.sh --login-setup 登录，再重新运行。profileDir=${profileDir}`);
+      }
+    } else {
+      await loginPage.close().catch(() => {});
+      console.log('[登录] 本轮无小红书博主，跳过小红书登录预检（抖音/B站在采集时各自校验 cookie）');
     }
     await humanDelay('启动后缓冲', delays.startupMs, [60000, 120000]);
 
@@ -1068,6 +1095,11 @@ async function main() {
           });
         let yearScoped = allVideoNotes;
         if (yearFilter) {
+          const datable = allVideoNotes.filter((note) => videoYear(note)).length;
+          // 小红书列表卡片不带发布时间(videoYear 恒空)，--year 对它无从过滤，全量保留。明确告警，别让用户误以为按年过滤已生效
+          if (isXhs && datable === 0 && allVideoNotes.length > 0) {
+            console.log(`[${creator.name}] ⚠️ 小红书列表无发布时间，--year=${yearFilter} 无法过滤，本博主按全量处理`);
+          }
           yearScoped = allVideoNotes.filter((note) => {
             const y = videoYear(note);
             if (!y) return true; // 判不出年份就保留，避免漏掉目标年份
@@ -1095,6 +1127,9 @@ async function main() {
         remainingVideoBudget -= selectedVideoNotes.length;
 
         const pendingComments = [];
+        // 评论采集抛错的视频：本轮不入库、下轮可重试。否则视频行照写、去重键持久化，
+        // 下轮 loadVideoKeys 把它当已入库跳过，该笔记评论(核心产物)永久丢失且无补抓路径
+        const failedVideoKeys = new Set();
         if (!skipComments) {
           for (const video of selectedVideoNotes) {
             const videoComments = [];
@@ -1127,20 +1162,24 @@ async function main() {
               await humanDelay('视频之间停顿', delays.betweenVideosMs, [180000, 360000]);
             } catch (error) {
               errors.push(`${creator.name}/${video.noteId || video.url}: ${error.message}`);
+              failedVideoKeys.add(video.uniqueKey); // 评论采集失败，本视频不入库、下轮重试
+              existingVideoKeys.delete(video.uniqueKey); // 本轮内存去重集也撤回，别误跳
             }
-            if (backfill) {
-              flushCreatorData(creator.name, [video], videoComments, stats, errors); // 回填逐条即时入库，崩溃只丢当前一条，可断点续抓
-            } else {
+            // 回填逐条即时入库(崩溃只丢当前一条，可断点续抓)：评论采集失败的视频跳过不写，留待下轮
+            if (backfill && !failedVideoKeys.has(video.uniqueKey)) {
+              flushCreatorData(creator.name, [video], videoComments, stats, errors);
+            } else if (!backfill) {
               pendingComments.push(...videoComments);
             }
           }
         }
 
-        // 非回填：本博主采完统一入库；回填+跳评论：只入视频
+        // 非回填：本博主采完统一入库(剔除评论采集失败的视频)；回填+跳评论：只入视频
+        const okVideos = creatorVideos.filter((v) => !failedVideoKeys.has(v.uniqueKey));
         if (!backfill) {
-          flushCreatorData(creator.name, creatorVideos, pendingComments, stats, errors);
+          flushCreatorData(creator.name, okVideos, pendingComments, stats, errors);
         } else if (skipComments) {
-          flushCreatorData(creator.name, creatorVideos, [], stats, errors);
+          flushCreatorData(creator.name, okVideos, [], stats, errors);
         }
 
         if (remainingVideoBudget <= 0) {

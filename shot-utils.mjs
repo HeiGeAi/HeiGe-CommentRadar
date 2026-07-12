@@ -235,7 +235,8 @@ export async function captureCommentShot(page, { platform, noteId, content, auth
         await new Promise((resolve) => setTimeout(resolve, 200));
       }
     }).catch(() => {});
-    // 评论容器高于内部滚动容器可视区时，超出部分被 overflow 裁掉、截进无关内容：临时钳住高度只截上半段
+    // 评论容器高于内部滚动容器可视区时，超出部分被 overflow 裁掉、截进无关内容：临时钳住高度只截上半段。
+    // 只在真有内部 overflow 滚动容器时钳(小红书/抖音)；B站是整页滚动、无内部容器，返回 0 不钳(否则高评论被误截)
     const containerViewH = await chosen.evaluate((node) => {
       let cur = node.parentElement;
       while (cur) {
@@ -243,11 +244,11 @@ export async function captureCommentShot(page, { platform, noteId, content, auth
         if (/(auto|scroll|overlay)/.test(st.overflowY) && cur.clientHeight > 100) return cur.clientHeight;
         cur = cur.parentElement;
       }
-      return window.innerHeight;
-    }).catch(() => 900);
+      return 0; // 没有内部滚动容器
+    }).catch(() => 0);
     const capPx = Math.max(300, containerViewH - 40);
     const boxNow = await chosen.boundingBox().catch(() => null);
-    const clamp = Boolean(boxNow && boxNow.height > capPx);
+    const clamp = Boolean(containerViewH > 0 && boxNow && boxNow.height > capPx);
     if (clamp) {
       await chosen.evaluate((node, h) => {
         node.__shotOldMaxHeight = node.style.maxHeight;

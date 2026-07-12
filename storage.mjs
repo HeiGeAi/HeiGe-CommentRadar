@@ -17,7 +17,9 @@ function zipRow(fields, row) {
 }
 
 function csvEscape(value) {
-  const text = value === null || value === undefined ? '' : String(value);
+  let text = value === null || value === undefined ? '' : String(value);
+  // 中和 CSV 公式注入：Excel/WPS 会把 = + - @ 及 Tab/CR 开头的单元格当公式执行(评论/标题是外来文本，必须防)
+  if (/^[=+\-@\t\r]/.test(text)) text = `'${text}`;
   if (/[",\n\r]/.test(text)) return `"${text.replace(/"/g, '""')}"`;
   return text;
 }
@@ -176,12 +178,17 @@ function createFeishuStorage(config, { runtimeDir, dryRun }) {
       const chunk = rows.slice(i, i + 200);
       const file = writeBatchJson(name, { fields, rows: chunk });
       const relPath = path.relative(runtimeDir, file);
-      const result = runLark([
-        'base', '+record-batch-create', '--as', 'user',
-        '--base-token', base.baseToken,
-        '--table-id', tableId,
-        '--json', `@${relPath}`
-      ], { cwd: runtimeDir });
+      let result;
+      try {
+        result = runLark([
+          'base', '+record-batch-create', '--as', 'user',
+          '--base-token', base.baseToken,
+          '--table-id', tableId,
+          '--json', `@${relPath}`
+        ], { cwd: runtimeDir });
+      } finally {
+        fs.rmSync(file, { force: true }); // lark-cli 已同步读完，删临时批次文件，别在 .runtime 堆积孤儿
+      }
       written += chunk.length;
       // record_id 在 data.record_id_list(与传入 rows 同序的扁平数组)，不在 records[].record_id
       const idList = result?.data?.record_id_list || result?.data?.data?.record_id_list || result?.record_id_list || [];

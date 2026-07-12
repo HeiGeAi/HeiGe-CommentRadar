@@ -172,9 +172,13 @@ function acquireLock() {
       return;
     } catch (err) {
       if (err.code !== 'EEXIST') throw err;
-      let lock = null;
-      try { lock = JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch {}
-      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid) {
+      // 半写锁文件会 parse 成 null，短暂重读几次别误删活锁(TOCTOU)
+      const readLock = () => { try { return JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { return null; } };
+      let lock = readLock();
+      for (let r = 0; r < 3 && lock === null; r += 1) { const sab = new Int32Array(new SharedArrayBuffer(4)); Atomics.wait(sab, 0, 0, 150); lock = readLock(); }
+      const ageMs = lock && lock.startedAt ? (Date.now() - Date.parse(lock.startedAt)) : 0;
+      const tooOld = ageMs > 24 * 3600 * 1000;
+      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid && !tooOld) {
         try {
           process.kill(lock.pid, 0);
           console.error(`已有任务在运行(pid=${lock.pid}, ${lock.tool || 'run-monitor'})，补图不能并行，等它跑完再来`);
@@ -203,6 +207,10 @@ try {
     if (prefs.profile) { prefs.profile.exit_type = 'Normal'; prefs.profile.exited_cleanly = true; fs.writeFileSync(prefPath, JSON.stringify(prefs)); }
   }
 } catch {}
+// 清上一轮非正常退出残留的 Singleton 锁，否则 launchPersistentContext 会卡死(已持 run.lock，确保无活进程用该 profile)
+for (const lockName of ['SingletonLock', 'SingletonCookie', 'SingletonSocket']) {
+  try { fs.rmSync(path.join(profileDir, lockName), { force: true }); } catch {}
+}
 
 let ctx = null;
 let stats = { creatorOk: 0, creatorFail: 0, contentOk: 0, commentOk: 0, commentFail: 0, skippedDead: 0 };
@@ -293,6 +301,7 @@ try {
           });
           if (file) {
             if (upload(T.comments, c.recordId, '评论截图', file)) { stats.commentOk += 1; console.log(`  ↳ 评论截图已挂：${clean(c.author, 20)} ${clean(c.content, 24)}`); }
+            else { stats.uploadFail = (stats.uploadFail || 0) + 1; } // 截到图但上传失败(如飞书 token 挂)，计数别静默吞
             pending.splice(j, 1);
           }
         }
@@ -325,4 +334,4 @@ if (fatalStop) {
   console.log(`已完成部分：主页 ${stats.creatorOk} 成/${stats.creatorFail} 败，内容图 ${stats.contentOk} 行，评论图 ${stats.commentOk} 成`);
   process.exit(1);
 }
-console.log(`\n补图完成：主页 ${stats.creatorOk} 成/${stats.creatorFail} 败，内容图 ${stats.contentOk} 行，评论图 ${stats.commentOk} 成/${stats.commentFail} 败，失效页跳过 ${stats.skippedDead}`);
+console.log(`\n补图完成：主页 ${stats.creatorOk} 成/${stats.creatorFail} 败，内容图 ${stats.contentOk} 行，评论图 ${stats.commentOk} 成/${stats.commentFail} 败${stats.uploadFail ? `，上传失败 ${stats.uploadFail}` : ''}，失效页跳过 ${stats.skippedDead}`);
