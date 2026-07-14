@@ -7,6 +7,11 @@ import { spawnSync } from 'node:child_process';
 import { captureCommentShot as captureCommentShotUtil } from './shot-utils.mjs';
 import { createStorage } from './storage.mjs';
 import { builtinVideoList, builtinComments, openXhsNoteViaProfile } from './collectors-builtin.mjs';
+import {
+  effectiveVideoLimit,
+  parseRunLimit,
+  videoLimitReachedMessage,
+} from './runtime-limits.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -43,7 +48,7 @@ const fastSettleMs = Number(argValue('--settle-ms', '0')) || 0; // fast-test 下
 const backfill = args.has('--backfill');
 const yearFilter = argValue('--year', '');
 const creatorMatch = argValue('--creator-match', '');
-const limitNew = Number(argValue('--limit-new', '0')) || 0; // 限制本轮最多入库 N 条新内容(测试/小步验证用)，回填模式也生效
+const limitNew = parseRunLimit(argValue('--limit-new', '0'), '--limit-new'); // 限制本轮最多入库 N 条新内容(测试/小步验证用)，回填模式也生效
 const maxNotesOverride = Number(argValue('--max-notes', '0')) || 0;
 const effectiveMaxNotes = maxNotesOverride || (backfill ? 80 : (config.runtime.maxCreatorNotes || 5));
 const skipComments = args.has('--skip-comments');
@@ -998,8 +1003,12 @@ async function main() {
     const stats = { scannedCreators: 0, newVideos: 0, fetchedComments: 0, insertedComments: 0, insertedVideos: 0 };
     const errors = [];
     let failedCreators = 0;
-    let remainingVideoBudget = backfill ? Infinity : (Number(config.runtime.maxVideosPerRun || 0) || Infinity);
-    if (limitNew > 0) remainingVideoBudget = Math.min(remainingVideoBudget, limitNew); // --limit-new 小步验证：入库 N 条就收工
+    const videoRunLimit = effectiveVideoLimit({
+      configuredLimit: config.runtime.maxVideosPerRun,
+      limitNew,
+      backfill,
+    });
+    let remainingVideoBudget = videoRunLimit;
 
     context = await ensureContext(context);
     const loginPage = await context.newPage();
@@ -1183,7 +1192,7 @@ async function main() {
         }
 
         if (remainingVideoBudget <= 0) {
-          console.log(`已达到本轮最大新视频处理数：${config.runtime.maxVideosPerRun}`);
+          console.log(videoLimitReachedMessage(videoRunLimit));
           break;
         }
       } catch (error) {
