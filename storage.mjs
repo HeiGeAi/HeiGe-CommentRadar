@@ -36,6 +36,37 @@ function appendJsonl(file, rows) {
   fs.appendFileSync(file, rows.map((r) => JSON.stringify(r)).join('\n') + '\n');
 }
 
+function fileSnapshot(file) {
+  try {
+    const stat = fs.statSync(file);
+    return { exists: true, isFile: stat.isFile(), size: stat.size };
+  } catch (error) {
+    if (error.code === 'ENOENT') return { exists: false, isFile: false, size: 0 };
+    throw error;
+  }
+}
+
+function restoreFile(file, snapshot) {
+  if (!snapshot.exists) {
+    fs.rmSync(file, { force: true });
+  } else if (snapshot.isFile) {
+    fs.truncateSync(file, snapshot.size);
+  }
+}
+
+function appendJsonlAndCsv(jsonlFile, csvFile, fields, rows) {
+  const jsonlSnapshot = fileSnapshot(jsonlFile);
+  const csvSnapshot = fileSnapshot(csvFile);
+  try {
+    appendJsonl(jsonlFile, rows);
+    appendCsv(csvFile, fields, rows);
+  } catch (error) {
+    try { restoreFile(jsonlFile, jsonlSnapshot); } catch {}
+    try { restoreFile(csvFile, csvSnapshot); } catch {}
+    throw error;
+  }
+}
+
 function readJsonlColumn(file, column) {
   const values = [];
   if (!fs.existsSync(file)) return values;
@@ -92,23 +123,20 @@ function createLocalStorage(config, { runtimeDir, dryRun, projectDir }) {
       if (dryRun) { console.log(`[dry-run] videos: ${payload.rows.length} rows`); return { written: payload.rows.length }; }
       const fields = [...payload.fields, '内容截图'];
       const rows = payload.rows.map((row, i) => ({ ...zipRow(payload.fields, row), 内容截图: rel(shots?.[i] || '') }));
-      appendJsonl(`${F.videos}.jsonl`, rows);
-      appendCsv(`${F.videos}.csv`, fields, rows);
+      appendJsonlAndCsv(`${F.videos}.jsonl`, `${F.videos}.csv`, fields, rows);
       return { written: rows.length };
     },
     saveComments: (payload, shots) => {
       if (dryRun) { console.log(`[dry-run] comments: ${payload.rows.length} rows`); return { written: payload.rows.length }; }
       const fields = [...payload.fields, '评论截图'];
       const rows = payload.rows.map((row, i) => ({ ...zipRow(payload.fields, row), 评论截图: rel(shots?.[i] || '') }));
-      appendJsonl(`${F.comments}.jsonl`, rows);
-      appendCsv(`${F.comments}.csv`, fields, rows);
+      appendJsonlAndCsv(`${F.comments}.jsonl`, `${F.comments}.csv`, fields, rows);
       return { written: rows.length };
     },
     saveRunLog: (payload) => {
       if (dryRun) return { written: 0 };
       const rows = payload.rows.map((row) => zipRow(payload.fields, row));
-      appendJsonl(`${F.runs}.jsonl`, rows);
-      appendCsv(`${F.runs}.csv`, payload.fields, rows);
+      appendJsonlAndCsv(`${F.runs}.jsonl`, `${F.runs}.csv`, payload.fields, rows);
       return { written: rows.length };
     }
   };
