@@ -2,7 +2,7 @@
 
 <div align="center">
 
-![Version](https://img.shields.io/badge/version-1.0.0-7c3aed.svg)
+![Version](https://img.shields.io/badge/version-1.0.1-7c3aed.svg)
 ![Agents](https://img.shields.io/badge/agents-universal-orange.svg)
 ![Platforms](https://img.shields.io/badge/platforms-小红书%20·%20抖音%20·%20B站-e11d48.svg)
 ![License](https://img.shields.io/badge/license-PolyForm%20NC-64748b.svg)

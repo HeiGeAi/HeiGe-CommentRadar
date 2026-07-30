@@ -160,7 +160,7 @@ export async function builtinVideoList(page, platform, maxCount) {
 // 通用评论解析：拿到评论容器的组合文本(跨 shadow DOM)，按行启发式拆 作者/内容/时间/点赞。
 // 结构假设：首行=作者名，时间行匹配日期/相对时间模式，点赞是独立短数字行，其余为内容。
 // 只解析容器里第一条(顶层评论)，时间行之后的子回复不混入。
-const PARSE_CONTAINER = (node) => {
+export const parseCommentContainer = (node) => {
   // 跨 shadow DOM 取组合文本；STYLE/SCRIPT 里的 CSS/JS 文本必须跳过(B站自定义元素 shadow root 里带 <style>)
   const deepText = (n) => {
     if (!n) return '';
@@ -214,6 +214,17 @@ const PARSE_CONTAINER = (node) => {
   if (!text) return null;
   return { author, content: text.slice(0, 1000), publishTime, likes };
 };
+
+export function dedupeParsedComments(comments) {
+  const seen = new Set();
+  return comments.filter((comment) => {
+    if (!comment) return false;
+    const key = `${comment.author}|${comment.content}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
 
 // 小红书笔记详情页必须带 xsec_token，主页卡片 href 是裸链(token 靠点击时 JS 注入)。
 // 回博主主页点该笔记卡片，让 XHS 自己带 token 打开笔记，再在打开后的页面抓评论。
@@ -280,26 +291,22 @@ export async function builtinComments(page, platform, maxCount) {
     if ((await loc.count().catch(() => 0)) > 0) { containers = loc; break; }
   }
   const total = Math.min(await containers.count().catch(() => 0), maxCount);
-  const records = [];
-  const seen = new Set();
+  const parsedRecords = [];
   for (let i = 0; i < total; i += 1) {
     const handle = await containers.nth(i).elementHandle().catch(() => null);
     if (!handle) continue;
-    const parsed = await handle.evaluate(PARSE_CONTAINER).catch(() => null);
+    const parsed = await handle.evaluate(parseCommentContainer).catch(() => null);
     await handle.dispose().catch(() => {});
-    if (!parsed) continue;
-    const key = `${parsed.author}|${parsed.content}`; // 用完整正文，别截断到60字(同作者不同长评论会误判重复)
-    if (seen.has(key)) continue;
-    seen.add(key);
-    records.push({
-      id: '', // DOM 拿不到评论 ID，引擎会用 作者+内容 兜底生成去重键
-      title: parsed.content,
-      content: parsed.content,
-      author: parsed.author,
-      likes: parsed.likes,
-      publishTime: parsed.publishTime,
-      extra: { replyCount: null, source: 'builtin' }
-    });
+    if (parsed) parsedRecords.push(parsed);
   }
-  return records;
+  return dedupeParsedComments(parsedRecords).map((parsed) => ({
+    // 用完整正文去重，别截断到60字(同作者不同长评论会误判重复)
+    id: '', // DOM 拿不到评论 ID，引擎会用 作者+内容 兜底生成去重键
+    title: parsed.content,
+    content: parsed.content,
+    author: parsed.author,
+    likes: parsed.likes,
+    publishTime: parsed.publishTime,
+    extra: { replyCount: null, source: 'builtin' }
+  }));
 }
