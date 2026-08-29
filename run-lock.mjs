@@ -14,6 +14,27 @@ function readLock(lockPath) {
   }
 }
 
+function readLockSnapshot(lockPath) {
+  let fd;
+  try {
+    fd = fs.openSync(lockPath, 'r');
+    const stat = fs.fstatSync(fd);
+    const lock = JSON.parse(fs.readFileSync(fd, 'utf8'));
+    return { lock, dev: stat.dev, ino: stat.ino };
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+  }
+}
+
+function sameLockSnapshot(left, right) {
+  if (!left || !right || left.dev !== right.dev || left.ino !== right.ino) return false;
+  const leftOwner = left.lock?.ownerId;
+  const rightOwner = right.lock?.ownerId;
+  return !leftOwner || !rightOwner || leftOwner === rightOwner;
+}
+
 function lockError(message) {
   const error = new Error(message);
   error.code = 'RUN_LOCK_HELD';
@@ -79,12 +100,15 @@ export function acquireFileRunLock({
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
 
-      let lock = readLock(lockPath);
-      for (let retry = 0; retry < 3 && lock === null; retry += 1) {
+      let snapshot = readLockSnapshot(lockPath);
+      for (let retry = 0; retry < 3 && snapshot === null; retry += 1) {
         sleepSync(150);
-        lock = readLock(lockPath);
+        snapshot = readLockSnapshot(lockPath);
       }
+      const lock = snapshot?.lock ?? null;
       if (!lock || ownerIsStillLive(lock)) throw lockError(heldMessage(lock));
+      const currentSnapshot = readLockSnapshot(lockPath);
+      if (!sameLockSnapshot(snapshot, currentSnapshot)) continue;
       fs.rmSync(lockPath, { force: true });
     }
   }

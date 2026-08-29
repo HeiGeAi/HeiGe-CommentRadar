@@ -157,4 +157,95 @@ describe('shared long-running lock', () => {
     lease.release();
     assert.equal(existsSync(lockPath), false);
   });
+
+  it('does not delete a competitor lock created after the stale-owner check', () => {
+    const lockPath = tempLockPath('reclaim-race');
+    const deadPid = 99_999_999;
+    writeFileSync(lockPath, JSON.stringify({
+      pid: deadPid,
+      tool: 'dead-owner',
+      ownerId: 'dead-owner-id',
+      processStartIdentity: 'dead-start',
+    }));
+    const competitor = {
+      pid: process.pid,
+      tool: 'competitor',
+      ownerId: 'competitor-owner-id',
+      processStartIdentity: getProcessStartIdentity(process.pid),
+    };
+    const originalKill = process.kill;
+    let injected = false;
+    process.kill = (pid, signal) => {
+      if (!injected && pid === deadPid && signal === 0) {
+        injected = true;
+        rmSync(lockPath, { force: true });
+        writeFileSync(lockPath, JSON.stringify(competitor));
+        const error = new Error('injected dead owner');
+        error.code = 'ESRCH';
+        throw error;
+      }
+      return originalKill.call(process, pid, signal);
+    };
+    try {
+      assert.throws(
+        () => acquireFileRunLock({
+          lockPath,
+          tool: 'late-reclaimer',
+          heartbeatIntervalMs: 0,
+        }),
+        (error) => error?.code === 'RUN_LOCK_HELD',
+      );
+      assert.equal(injected, true);
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), competitor);
+    } finally {
+      process.kill = originalKill;
+    }
+  });
+
+  it('reclaims a reused live PID when the process start identity changed', () => {
+    const lockPath = tempLockPath('pid-reuse');
+    writeFileSync(lockPath, JSON.stringify({
+      pid: process.pid,
+      tool: 'reused-pid-owner',
+      ownerId: 'reused-pid-owner-id',
+      processStartIdentity: 'not-the-current-process-start',
+    }));
+
+    const lease = acquireFileRunLock({
+      lockPath,
+      tool: 'replacement-after-pid-reuse',
+      heartbeatIntervalMs: 0,
+    });
+    const replacement = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(replacement.tool, 'replacement-after-pid-reuse');
+    assert.notEqual(replacement.ownerId, 'reused-pid-owner-id');
+    lease.release();
+  });
+
+  it('keeps a live lock when process start identity cannot be read', () => {
+    const lockPath = tempLockPath('identity-unavailable');
+    const original = {
+      pid: process.pid,
+      tool: 'identity-unavailable-owner',
+      ownerId: 'identity-unavailable-owner-id',
+      processStartIdentity: 'recorded-process-start',
+    };
+    writeFileSync(lockPath, JSON.stringify(original));
+    const originalPath = process.env.PATH;
+    process.env.PATH = '';
+    try {
+      assert.throws(
+        () => acquireFileRunLock({
+          lockPath,
+          tool: 'must-not-reclaim-unknown-identity',
+          heartbeatIntervalMs: 0,
+        }),
+        (error) => error?.code === 'RUN_LOCK_HELD',
+      );
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), original);
+    } finally {
+      if (originalPath === undefined) delete process.env.PATH;
+      else process.env.PATH = originalPath;
+    }
+  });
 });
