@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { captureCommentShot, scrollCommentArea, pageGuard, ensureCommentsVisible, expandReplies } from './shot-utils.mjs';
+import { acquireFileRunLock } from './run-lock.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -164,38 +165,23 @@ if ((skipCreators || pendingCreators.length === 0) && noteList.length === 0) { c
 
 // ===== 双向互斥锁：和 run-monitor 共用 run.lock.json，谁在跑另一个就进不来 =====
 const lockPath = path.join(__dirname, '.runtime', 'run.lock.json');
+let lockLease = null;
 function acquireLock() {
-  const payload = () => JSON.stringify({ pid: process.pid, tool: 'backfill-shots', startedAt: new Date().toISOString(), argv: process.argv.slice(2) }, null, 2);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      fs.writeFileSync(lockPath, payload(), { flag: 'wx' });
-      return;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      // 半写锁文件会 parse 成 null，短暂重读几次别误删活锁(TOCTOU)
-      const readLock = () => { try { return JSON.parse(fs.readFileSync(lockPath, 'utf8')); } catch { return null; } };
-      let lock = readLock();
-      for (let r = 0; r < 3 && lock === null; r += 1) { const sab = new Int32Array(new SharedArrayBuffer(4)); Atomics.wait(sab, 0, 0, 150); lock = readLock(); }
-      const ageMs = lock && lock.startedAt ? (Date.now() - Date.parse(lock.startedAt)) : 0;
-      const tooOld = ageMs > 24 * 3600 * 1000;
-      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid && !tooOld) {
-        try {
-          process.kill(lock.pid, 0);
-          console.error(`已有任务在运行(pid=${lock.pid}, ${lock.tool || 'run-monitor'})，补图不能并行，等它跑完再来`);
-          process.exit(1);
-        } catch {}
-      }
-      fs.rmSync(lockPath, { force: true }); // 死锁清掉重抢
-    }
+  try {
+    lockLease = acquireFileRunLock({
+      lockPath,
+      tool: 'backfill-shots',
+      heldMessage: (lock) => `已有任务在运行(pid=${lock?.pid ?? 'unknown'}, ${lock?.tool || 'run-monitor'})，补图不能并行，等它跑完再来`,
+    });
+  } catch (error) {
+    if (error?.code !== 'RUN_LOCK_HELD') throw error;
+    console.error(error.message);
+    process.exit(1);
   }
-  console.error('抢锁两次仍失败，放弃本次补图');
-  process.exit(1);
 }
 function releaseLock() {
-  try {
-    const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
-    if (lock.pid === process.pid) fs.rmSync(lockPath, { force: true });
-  } catch {}
+  lockLease?.release();
+  lockLease = null;
 }
 acquireLock();
 

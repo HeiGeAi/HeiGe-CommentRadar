@@ -7,6 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { captureCommentShot as captureCommentShotUtil } from './shot-utils.mjs';
 import { createStorage } from './storage.mjs';
 import { builtinVideoList, builtinComments, openXhsNoteViaProfile } from './collectors-builtin.mjs';
+import { acquireFileRunLock } from './run-lock.mjs';
 import {
   effectiveVideoLimit,
   parseRunLimit,
@@ -174,18 +175,11 @@ function processExists(pid) {
   }
 }
 
-function readRunLock() {
-  try {
-    return JSON.parse(fs.readFileSync(runLockPath, 'utf8'));
-  } catch {
-    return null;
-  }
-}
+let runLockLease = null;
 
 function releaseRunLock() {
-  const lock = readRunLock();
-  if (!lock || lock.pid !== process.pid) return;
-  fs.rmSync(runLockPath, { force: true });
+  runLockLease?.release();
+  runLockLease = null;
 }
 
 // 博主级颗粒度进度快照：仅在进入下一个 creator 循环体时写入，不做阶段级埋点
@@ -235,40 +229,15 @@ function writeLoginStatus(platform, ok) {
 }
 
 function acquireRunLock() {
-  // {flag:'wx'} 原子抢锁：读后写有秒级窗口(启动加载期)，工作台连点两次会双跑抢同一 profile。
-  // EEXIST 时读锁判活：持有者活着就报错，死锁(stale)删掉重抢一次。
-  const payload = () => JSON.stringify({
-    pid: process.pid,
+  runLockLease = acquireFileRunLock({
+    lockPath: runLockPath,
+    tool: 'run-monitor',
     runId,
-    startedAt: now(),
-    argv: process.argv.slice(2)
-  }, null, 2);
-  for (let attempt = 0; attempt < 2; attempt += 1) {
-    try {
-      fs.writeFileSync(runLockPath, payload(), { flag: 'wx' });
-      // 拿锁成功即清陈旧停止标记：上一轮被 SIGKILL/断电没走 finally 时标记会残留，
-      // 不清的话本轮跑完第一个博主就被旧标记优雅退出，日志还记"成功"
-      clearStopRequested();
-      return;
-    } catch (err) {
-      if (err.code !== 'EEXIST') throw err;
-      // 读锁判活。半写文件(刚 wx 创建还没写内容)会 parse 成 null，短暂重读几次，
-      // 别把正在写的活锁误删导致两个进程同时拿锁(TOCTOU)
-      let lock = readRunLock();
-      for (let r = 0; r < 3 && lock === null; r += 1) { sleepSync(150); lock = readRunLock(); }
-      const ageMs = lock && lock.startedAt ? (Date.now() - Date.parse(String(lock.startedAt).replace(' ', 'T'))) : 0;
-      const tooOld = ageMs > 24 * 3600 * 1000; // 超 24h 视为残锁(PID 可能已被系统复用)，避免永久静默空跑
-      if (lock && Number.isFinite(lock.pid) && lock.pid !== process.pid && processExists(lock.pid) && !tooOld) {
-        const lockErr = new Error(`已有监控任务在运行。pid=${lock.pid} startedAt=${lock.startedAt}。请等待当前任务结束后再重试，避免抢占同一 Chrome profile。`);
-        lockErr.code = 'RUN_LOCK_HELD';
-        throw lockErr;
-      }
-      fs.rmSync(runLockPath, { force: true });
-    }
-  }
-  const lockErr = new Error('抢锁两次仍失败(锁文件被并发反复创建)，放弃本次运行。');
-  lockErr.code = 'RUN_LOCK_HELD';
-  throw lockErr;
+    heldMessage: (lock) => `已有监控任务在运行。pid=${lock?.pid ?? 'unknown'} startedAt=${lock?.startedAt ?? 'unknown'}。请等待当前任务结束后再重试，避免抢占同一 Chrome profile。`,
+  });
+  // 拿锁成功即清陈旧停止标记：上一轮被 SIGKILL/断电没走 finally 时标记会残留，
+  // 不清的话本轮跑完第一个博主就被旧标记优雅退出，日志还记"成功"
+  clearStopRequested();
 }
 
 function closeExistingProfileProcesses() {

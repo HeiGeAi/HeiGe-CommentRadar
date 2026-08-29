@@ -1,12 +1,54 @@
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
-import { describe, it } from 'node:test';
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from 'node:fs';
+import { tmpdir } from 'node:os';
+import path from 'node:path';
+import { spawn } from 'node:child_process';
+import { once } from 'node:events';
+import { after, describe, it } from 'node:test';
 
 import {
   effectiveVideoLimit,
   parseRunLimit,
   videoLimitReachedMessage,
 } from '../runtime-limits.mjs';
+import {
+  acquireFileRunLock,
+  getProcessStartIdentity,
+} from '../run-lock.mjs';
+
+const temporaryRoots = [];
+const childProcesses = [];
+
+after(async () => {
+  for (const child of childProcesses) {
+    if (child.exitCode !== null) continue;
+    const exited = once(child, 'exit');
+    child.kill('SIGTERM');
+    await exited;
+  }
+  for (const root of temporaryRoots) rmSync(root, { recursive: true, force: true });
+});
+
+function tempLockPath(label) {
+  const root = mkdtempSync(path.join(tmpdir(), `comment-radar-${label}-`));
+  temporaryRoots.push(root);
+  return path.join(root, 'run.lock.json');
+}
+
+async function liveChild() {
+  const child = spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {
+    stdio: 'ignore',
+  });
+  childProcesses.push(child);
+  await once(child, 'spawn');
+  return child;
+}
 
 describe('effectiveVideoLimit', () => {
   it('uses the configured per-run limit by default', () => {
@@ -44,5 +86,75 @@ describe('effectiveVideoLimit', () => {
   it('accepts zero and positive integer limits', () => {
     assert.equal(parseRunLimit('0', '--limit-new'), 0);
     assert.equal(parseRunLimit('12', '--limit-new'), 12);
+  });
+});
+
+describe('shared long-running lock', () => {
+  it('does not let run-monitor expire a live owner only because the lock is old', () => {
+    const source = readFileSync(new URL('../run-monitor.mjs', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /processExists\(lock\.pid\)\s*&&\s*!tooOld/);
+  });
+
+  it('does not let backfill expire a live owner only because the lock is old', () => {
+    const source = readFileSync(new URL('../backfill-shots.mjs', import.meta.url), 'utf8');
+    assert.doesNotMatch(source, /lock\.pid !== process\.pid\s*&&\s*!tooOld/);
+  });
+
+  for (const tool of ['run-monitor', 'backfill-shots']) {
+    it(`${tool} preserves a lock older than 24 hours while its PID is alive`, async () => {
+      const child = await liveChild();
+      const lockPath = tempLockPath(`${tool}-live`);
+      const oldTimestamp = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+      const original = {
+        pid: child.pid,
+        tool: 'existing-owner',
+        runId: 'existing-run',
+        startedAt: oldTimestamp,
+        heartbeatAt: oldTimestamp,
+        processStartIdentity: getProcessStartIdentity(child.pid),
+      };
+      writeFileSync(lockPath, JSON.stringify(original));
+
+      assert.throws(
+        () => acquireFileRunLock({ lockPath, tool, runId: `new-${tool}`, heartbeatIntervalMs: 0 }),
+        (error) => error?.code === 'RUN_LOCK_HELD',
+      );
+      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), original);
+    });
+  }
+
+  it('reclaims a lock only after its recorded PID is confirmed dead', async () => {
+    const child = await liveChild();
+    const deadPid = child.pid;
+    const deadIdentity = getProcessStartIdentity(deadPid);
+    const exited = once(child, 'exit');
+    child.kill('SIGTERM');
+    await exited;
+
+    const lockPath = tempLockPath('dead');
+    const oldTimestamp = new Date(Date.now() - 48 * 3600 * 1000).toISOString();
+    writeFileSync(lockPath, JSON.stringify({
+      pid: deadPid,
+      tool: 'dead-owner',
+      runId: 'dead-run',
+      startedAt: oldTimestamp,
+      heartbeatAt: oldTimestamp,
+      processStartIdentity: deadIdentity,
+    }));
+
+    const lease = acquireFileRunLock({
+      lockPath,
+      tool: 'run-monitor',
+      runId: 'replacement-run',
+      heartbeatIntervalMs: 0,
+    });
+    const replacement = JSON.parse(readFileSync(lockPath, 'utf8'));
+    assert.equal(replacement.pid, process.pid);
+    assert.equal(replacement.tool, 'run-monitor');
+    assert.equal(typeof replacement.processStartIdentity, 'string');
+    assert.equal(typeof replacement.heartbeatAt, 'string');
+
+    lease.release();
+    assert.equal(existsSync(lockPath), false);
   });
 });
