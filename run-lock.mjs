@@ -1,6 +1,10 @@
 import fs from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
+import path from 'node:path';
+
+const RECLAIM_GUARD_WAIT_MS = 150;
+const INVALID_GUARD_STALE_MS = 30_000;
 
 function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
@@ -28,17 +32,130 @@ function readLockSnapshot(lockPath) {
   }
 }
 
-function sameLockSnapshot(left, right) {
-  if (!left || !right || left.dev !== right.dev || left.ino !== right.ino) return false;
-  const leftOwner = left.lock?.ownerId;
-  const rightOwner = right.lock?.ownerId;
-  return !leftOwner || !rightOwner || leftOwner === rightOwner;
-}
-
 function lockError(message) {
   const error = new Error(message);
   error.code = 'RUN_LOCK_HELD';
   return error;
+}
+
+function publishGuardFile(target, payload, { replace = false } = {}) {
+  const temporary = `${target}.${randomUUID()}.tmp`;
+  let fd;
+  try {
+    fd = fs.openSync(temporary, 'wx', 0o600);
+    fs.writeFileSync(fd, JSON.stringify(payload), 'utf8');
+    fs.fsyncSync(fd);
+    if (replace) fs.renameSync(temporary, target);
+    else fs.linkSync(temporary, target);
+  } finally {
+    if (fd !== undefined) fs.closeSync(fd);
+    fs.rmSync(temporary, { force: true });
+  }
+}
+
+function guardParticipant(lockPath) {
+  try {
+    const stat = fs.statSync(lockPath);
+    const lock = JSON.parse(fs.readFileSync(lockPath, 'utf8'));
+    return { path: lockPath, lock, invalid: false, mtimeMs: stat.mtimeMs };
+  } catch {
+    try {
+      return {
+        path: lockPath,
+        lock: null,
+        invalid: true,
+        mtimeMs: fs.statSync(lockPath).mtimeMs,
+      };
+    } catch {
+      return null;
+    }
+  }
+}
+
+function activeGuardParticipants(guardDirectory) {
+  let names;
+  try {
+    names = fs.readdirSync(guardDirectory);
+  } catch (error) {
+    if (error.code === 'ENOENT') return [];
+    throw error;
+  }
+
+  const participants = [];
+  for (const name of names) {
+    if (!name.endsWith('.claim.json')) continue;
+    const participant = guardParticipant(path.join(guardDirectory, name));
+    if (!participant) continue;
+    if (participant.invalid) {
+      if (Date.now() - participant.mtimeMs >= INVALID_GUARD_STALE_MS) {
+        fs.rmSync(participant.path, { force: true });
+      } else {
+        participants.push(participant);
+      }
+      continue;
+    }
+    if (!ownerIsStillLive(participant.lock)) {
+      fs.rmSync(participant.path, { force: true });
+      continue;
+    }
+    participants.push(participant);
+  }
+  return participants;
+}
+
+function acquireReclaimGuard(lockPath) {
+  const guardDirectory = `${lockPath}.reclaim`;
+  fs.mkdirSync(guardDirectory, { recursive: true });
+  const ownerId = randomUUID();
+  const identity = {
+    pid: process.pid,
+    ownerId,
+    processStartIdentity: getProcessStartIdentity(process.pid),
+  };
+  const participantPath = path.join(guardDirectory, `${ownerId}.claim.json`);
+  const cleanup = () => {
+    fs.rmSync(participantPath, { force: true });
+  };
+
+  try {
+    publishGuardFile(participantPath, { ...identity, choosing: true, ticket: 0 });
+    const tickets = activeGuardParticipants(guardDirectory)
+      .filter((participant) => participant.lock?.choosing === false)
+      .map((participant) => Number(participant.lock?.ticket) || 0);
+    const ticket = Math.max(0, ...tickets) + 1;
+    publishGuardFile(
+      participantPath,
+      { ...identity, choosing: false, ticket },
+      { replace: true },
+    );
+
+    const deadline = Date.now() + RECLAIM_GUARD_WAIT_MS;
+    while (true) {
+      const blocked = activeGuardParticipants(guardDirectory).some((participant) => {
+        if (participant.lock?.ownerId === ownerId) return false;
+        if (participant.invalid || participant.lock?.choosing !== false) return true;
+        const otherTicket = Number(participant.lock?.ticket);
+        if (!Number.isSafeInteger(otherTicket) || otherTicket <= 0) return true;
+        return otherTicket < ticket
+          || (otherTicket === ticket && participant.lock.ownerId < ownerId);
+      });
+      if (!blocked) {
+        let released = false;
+        return () => {
+          if (released) return;
+          released = true;
+          cleanup();
+        };
+      }
+      if (Date.now() >= deadline) {
+        throw lockError('另一个回收事务正在处理运行锁。');
+      }
+      sleepSync(10);
+    }
+  } catch (error) {
+    cleanup();
+    throw error;
+  }
 }
 
 function processState(pid) {
@@ -107,9 +224,25 @@ export function acquireFileRunLock({
       }
       const lock = snapshot?.lock ?? null;
       if (!lock || ownerIsStillLive(lock)) throw lockError(heldMessage(lock));
-      const currentSnapshot = readLockSnapshot(lockPath);
-      if (!sameLockSnapshot(snapshot, currentSnapshot)) continue;
-      fs.rmSync(lockPath, { force: true });
+      const releaseReclaimGuard = acquireReclaimGuard(lockPath);
+      let publishedUnderGuard = false;
+      try {
+        const currentSnapshot = readLockSnapshot(lockPath);
+        const currentLock = currentSnapshot?.lock ?? null;
+        if (!currentLock || ownerIsStillLive(currentLock)) {
+          throw lockError(heldMessage(currentLock));
+        }
+        fs.rmSync(lockPath, { force: true });
+        try {
+          fs.writeFileSync(lockPath, JSON.stringify(payload, null, 2), { flag: 'wx' });
+          publishedUnderGuard = true;
+        } catch (publishError) {
+          if (publishError.code !== 'EEXIST') throw publishError;
+        }
+      } finally {
+        releaseReclaimGuard();
+      }
+      if (publishedUnderGuard) break;
     }
   }
 

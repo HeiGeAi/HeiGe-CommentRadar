@@ -1,6 +1,8 @@
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import {
   existsSync,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -158,7 +160,7 @@ describe('shared long-running lock', () => {
     assert.equal(existsSync(lockPath), false);
   });
 
-  it('does not delete a competitor lock created after the stale-owner check', () => {
+  it('serializes a competing reclaimer arriving at stale-lock removal', () => {
     const lockPath = tempLockPath('reclaim-race');
     const deadPid = 99_999_999;
     writeFileSync(lockPath, JSON.stringify({
@@ -167,39 +169,192 @@ describe('shared long-running lock', () => {
       ownerId: 'dead-owner-id',
       processStartIdentity: 'dead-start',
     }));
-    const competitor = {
-      pid: process.pid,
-      tool: 'competitor',
-      ownerId: 'competitor-owner-id',
-      processStartIdentity: getProcessStartIdentity(process.pid),
-    };
-    const originalKill = process.kill;
+    const originalRmSync = fs.rmSync;
     let injected = false;
-    process.kill = (pid, signal) => {
-      if (!injected && pid === deadPid && signal === 0) {
+    let competitorLease;
+    let competitorError;
+    let reclaimerLease;
+    fs.rmSync = (target, options) => {
+      if (!injected && target === lockPath) {
         injected = true;
-        rmSync(lockPath, { force: true });
-        writeFileSync(lockPath, JSON.stringify(competitor));
-        const error = new Error('injected dead owner');
-        error.code = 'ESRCH';
-        throw error;
+        try {
+          competitorLease = acquireFileRunLock({
+            lockPath,
+            tool: 'competitor',
+            heartbeatIntervalMs: 0,
+          });
+        } catch (error) {
+          competitorError = error;
+        }
       }
-      return originalKill.call(process, pid, signal);
+      return originalRmSync(target, options);
     };
     try {
-      assert.throws(
-        () => acquireFileRunLock({
-          lockPath,
-          tool: 'late-reclaimer',
-          heartbeatIntervalMs: 0,
-        }),
-        (error) => error?.code === 'RUN_LOCK_HELD',
-      );
+      reclaimerLease = acquireFileRunLock({
+        lockPath,
+        tool: 'late-reclaimer',
+        heartbeatIntervalMs: 0,
+      });
       assert.equal(injected, true);
-      assert.deepEqual(JSON.parse(readFileSync(lockPath, 'utf8')), competitor);
+      assert.equal(competitorLease, undefined);
+      assert.equal(competitorError?.code, 'RUN_LOCK_HELD');
+      assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).tool, 'late-reclaimer');
     } finally {
-      process.kill = originalKill;
+      fs.rmSync = originalRmSync;
+      competitorLease?.release();
+      reclaimerLease?.release();
     }
+  });
+
+  it('publishes the replacement lock before releasing the reclaim guard', () => {
+    const lockPath = tempLockPath('publish-before-guard-release');
+    writeFileSync(lockPath, JSON.stringify({
+      pid: 99_999_999,
+      tool: 'dead-owner',
+      ownerId: 'dead-owner-id',
+      processStartIdentity: 'dead-start',
+    }));
+    const originalRmSync = fs.rmSync;
+    let injected = false;
+    let competitorLease;
+    let competitorError;
+    let reclaimerLease;
+    let reclaimerError;
+    fs.rmSync = (target, options) => {
+      if (!injected && typeof target === 'string' && target.endsWith('.claim.json')) {
+        injected = true;
+        try {
+          competitorLease = acquireFileRunLock({
+            lockPath,
+            tool: 'guard-release-competitor',
+            heartbeatIntervalMs: 0,
+          });
+        } catch (error) {
+          competitorError = error;
+        }
+      }
+      return originalRmSync(target, options);
+    };
+    try {
+      try {
+        reclaimerLease = acquireFileRunLock({
+          lockPath,
+          tool: 'guarded-reclaimer',
+          heartbeatIntervalMs: 0,
+        });
+      } catch (error) {
+        reclaimerError = error;
+      }
+      assert.equal(injected, true);
+      assert.equal(reclaimerError, undefined);
+      assert.equal(competitorLease, undefined);
+      assert.equal(competitorError?.code, 'RUN_LOCK_HELD');
+      assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).tool, 'guarded-reclaimer');
+    } finally {
+      fs.rmSync = originalRmSync;
+      competitorLease?.release();
+      reclaimerLease?.release();
+    }
+  });
+
+  it('preserves a fresh owner that wins wx after stale-lock deletion', () => {
+    const lockPath = tempLockPath('post-delete-wx-race');
+    writeFileSync(lockPath, JSON.stringify({
+      pid: 99_999_999,
+      tool: 'dead-owner',
+      ownerId: 'dead-owner-id',
+      processStartIdentity: 'dead-start',
+    }));
+    const originalRmSync = fs.rmSync;
+    let injected = false;
+    let competitorLease;
+    let reclaimerError;
+    fs.rmSync = (target, options) => {
+      if (!injected && target === lockPath) {
+        const result = originalRmSync(target, options);
+        injected = true;
+        competitorLease = acquireFileRunLock({
+          lockPath,
+          tool: 'post-delete-competitor',
+          heartbeatIntervalMs: 0,
+        });
+        return result;
+      }
+      return originalRmSync(target, options);
+    };
+    try {
+      try {
+        acquireFileRunLock({
+          lockPath,
+          tool: 'must-not-overwrite-fresh-owner',
+          heartbeatIntervalMs: 0,
+        });
+      } catch (error) {
+        reclaimerError = error;
+      }
+      assert.equal(injected, true);
+      assert.equal(reclaimerError?.code, 'RUN_LOCK_HELD');
+      assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).tool, 'post-delete-competitor');
+    } finally {
+      fs.rmSync = originalRmSync;
+      competitorLease?.release();
+    }
+  });
+
+  it('keeps a stale lock while another live reclaimer owns the guard', () => {
+    const lockPath = tempLockPath('live-reclaim-guard');
+    writeFileSync(lockPath, JSON.stringify({
+      pid: 99_999_999,
+      tool: 'dead-owner',
+      ownerId: 'dead-owner-id',
+      processStartIdentity: 'dead-start',
+    }));
+    const guardDirectory = `${lockPath}.reclaim`;
+    mkdirSync(guardDirectory);
+    writeFileSync(path.join(guardDirectory, 'live.claim.json'), JSON.stringify({
+      pid: process.pid,
+      ownerId: 'live-reclaimer',
+      processStartIdentity: getProcessStartIdentity(process.pid),
+      choosing: false,
+      ticket: 1,
+    }));
+
+    assert.throws(
+      () => acquireFileRunLock({
+        lockPath,
+        tool: 'blocked-reclaimer',
+        heartbeatIntervalMs: 0,
+      }),
+      (error) => error?.code === 'RUN_LOCK_HELD',
+    );
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).tool, 'dead-owner');
+  });
+
+  it('ignores a dead reclaimer claim without leaving a permanent guard', () => {
+    const lockPath = tempLockPath('dead-reclaim-guard');
+    writeFileSync(lockPath, JSON.stringify({
+      pid: 99_999_998,
+      tool: 'dead-owner',
+      ownerId: 'dead-owner-id',
+      processStartIdentity: 'dead-start',
+    }));
+    const guardDirectory = `${lockPath}.reclaim`;
+    mkdirSync(guardDirectory);
+    writeFileSync(path.join(guardDirectory, 'dead.claim.json'), JSON.stringify({
+      pid: 99_999_997,
+      ownerId: 'dead-reclaimer',
+      processStartIdentity: 'dead-reclaimer-start',
+      choosing: false,
+      ticket: 1,
+    }));
+
+    const lease = acquireFileRunLock({
+      lockPath,
+      tool: 'recovered-after-dead-guard',
+      heartbeatIntervalMs: 0,
+    });
+    assert.equal(JSON.parse(readFileSync(lockPath, 'utf8')).tool, 'recovered-after-dead-guard');
+    lease.release();
   });
 
   it('reclaims a reused live PID when the process start identity changed', () => {
