@@ -180,8 +180,15 @@ function createFeishuStorage(config, { runtimeDir, dryRun }) {
       for (const field of fieldNames) argv.push('--field-id', field);
       const result = runLark(argv);
       const data = result.data || {};
-      rows.push(...(data.data || []));
-      recordIds.push(...(data.record_id_list || []));
+      const pageRows = data.data || [];
+      const pageIds = data.record_id_list || [];
+      // 读路径防错位：data 与 record_id_list 不等长时 rows[i]/recordIds[i] 整体错开，
+      // 后续主页/评论截图会挂到错误记录(写路径 batchCreate 已有同款防御)，宁可中止也不带病上传
+      if (pageIds.length !== pageRows.length) {
+        throw new Error(`飞书分页返回错位(table=${tableId}, offset=${offset})：data ${pageRows.length} 行 vs record_id_list ${pageIds.length} 个，中止防止截图挂错记录`);
+      }
+      rows.push(...pageRows);
+      recordIds.push(...pageIds);
       if (!data.has_more) break;
       offset += 200;
     }

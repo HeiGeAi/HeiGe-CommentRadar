@@ -63,8 +63,14 @@ function listAll(tableId, fields) {
     for (const f of fields) argv.push('--field-id', f);
     const d = lark(argv);
     const data = d.data || {};
-    rows.push(...(data.data || []));
-    rids.push(...(data.record_id_list || []));
+    const pageRows = data.data || [];
+    const pageIds = data.record_id_list || [];
+    // 读路径防错位：data 与 record_id_list 不等长时 rows[i]/rids[i] 整体错开，截图会挂错记录，宁可中止
+    if (pageIds.length !== pageRows.length) {
+      throw new Error(`飞书分页返回错位(table=${tableId}, offset=${offset})：data ${pageRows.length} 行 vs record_id_list ${pageIds.length} 个，中止防止截图挂错记录`);
+    }
+    rows.push(...pageRows);
+    rids.push(...pageIds);
     if (!data.has_more) break;
     offset += 200;
   }
