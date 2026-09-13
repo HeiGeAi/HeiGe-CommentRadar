@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
+import crypto from 'node:crypto';
 import { captureCommentShot as captureCommentShotUtil } from './shot-utils.mjs';
 import { createStorage } from './storage.mjs';
 import { builtinVideoList, builtinComments, openXhsNoteViaProfile } from './collectors-builtin.mjs';
@@ -77,10 +78,12 @@ function loadPlatformScripts() {
     for (const [name, paths] of Object.entries(platforms)) {
       // 单平台脚本缺失不连累其它平台：该平台自动回落内置采集器
       try {
-        cache[name] = {
-          userVideo: fs.readFileSync(resolveScript(paths.userVideoScript), 'utf8'),
-          comment: fs.readFileSync(resolveScript(paths.commentScript), 'utf8')
-        };
+        const userVideo = fs.readFileSync(resolveScript(paths.userVideoScript), 'utf8');
+        const comment = fs.readFileSync(resolveScript(paths.commentScript), 'utf8');
+        cache[name] = { userVideo, comment };
+        // 增强脚本在已登录页面上下文内 eval 执行，信任等级等同登录态本身；打印 sha256 便于审计脚本是否被动过
+        const shortHash = (s) => crypto.createHash('sha256').update(s).digest('hex').slice(0, 16);
+        console.log(`[采集器] ${name} 增强脚本已加载(在登录态页面内执行，信任等级等同登录态)：sha256 ${shortHash(userVideo)}/${shortHash(comment)}`);
       } catch (error) {
         console.error(`[采集器] ${name} 增强脚本加载失败，回落内置 DOM 采集器：${String(error.message).split('\n')[0]}`);
       }

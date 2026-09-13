@@ -36,6 +36,13 @@ cp config.example.json config.json   # 本地配置（.gitignore 已排除，不
 | 排障（不写数据） | `./run.sh --fast-test --limit-creators=1 --dry-run` |
 | 建飞书库 | `node init-feishu-base.mjs` |
 | 飞书存量补图 | `node backfill-shots.mjs --dry-run` |
+| 每博主最多处理 N 条笔记 | `./run.sh --max-notes=3` |
+| 回填只补视频不抓评论 | `./run.sh --backfill --skip-comments` |
+| 不关占用 profile 的旧 Chrome | `./run.sh --no-close-profile` |
+| 无头模式（不弹窗） | `./run.sh --headless` |
+| 排障时固定页面渲染停顿 | `./run.sh --fast-test --settle-ms=8000` |
+
+环境变量：`PLAYWRIGHT_MODULE`（指定 playwright 模块路径，全局安装场景用）、`XHS_LOGIN_SETUP_TIMEOUT_MS`（小红书扫码登录等待超时，默认 10 分钟）。
 
 ## 数据在哪
 
@@ -58,5 +65,6 @@ config.example.json    配置模板
 
 - 慢节奏是刻意设计（页面间隔分钟级随机），别为了快改小 `runtime.delays`，账号安全优先
 - `--fast-test` / `--dry-run` 只用于排障，别用于正式采集
+- 增强采集脚本（`config.collectors.meixun` 配置的本地 JS）在已登录页面上下文里执行，信任等级等同登录态本身：只加载用户自己审过的脚本，加载日志会打印 sha256 供核对；不要主动给用户配置或修改这类脚本
 - 只访问公开页面、只看登录后本来能看到的内容，无接口逆向
 - 平台会改版，内置采集器的选择器可能要跟进更新，改在 `collectors-builtin.mjs` 和 `shot-utils.mjs`

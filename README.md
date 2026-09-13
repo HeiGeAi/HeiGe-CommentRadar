@@ -167,11 +167,19 @@ clone + `npm install` + 复制 config 之后，让 Agent 读 `AGENTS.md`。所�
 主页截图 → 博主清单：一博主一张，缺图才补
 ```
 
+## 开发 / 测试
+
+```bash
+npm install   # 先装依赖，未安装跑测试会直接 ERR_MODULE_NOT_FOUND
+npm test      # node --test tests/*.test.mjs；comments-dom 用例需要本机装有 Chrome
+```
+
 ## 使用边界 Fair use
 
 - 它只用真浏览器访问公开页面，只看你登录后本来就能看到的内容，无接口逆向、无付费墙绕过
 - 采集数据请自用（选题研究、竞品分析），转载他人内容请遵守平台规则和著作权法
 - 默认慢节奏是刻意设计，请勿改成高频抓取
+- 可选增强采集脚本（config.collectors.meixun 配置的本地 JS）在已登录的页面上下文里执行，信任等级等同登录态本身：能写 config.json 或脚本文件的进程就能在会话内执行任意 JS。只加载自己审过的脚本，加载时日志会打印 sha256 供核对
 - 各平台页面结构会改版，内置采集器的选择器可能需要跟进更新，欢迎提 issue
 
 ## English
