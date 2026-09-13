@@ -14,6 +14,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { spawnSync } from 'node:child_process';
 import { captureCommentShot, scrollCommentArea, pageGuard, ensureCommentsVisible, expandReplies } from './shot-utils.mjs';
+import { openXhsNoteViaProfile } from './collectors-builtin.mjs';
 
 const require = createRequire(import.meta.url);
 const { chromium } = require(process.env.PLAYWRIGHT_MODULE || 'playwright');
@@ -261,7 +262,22 @@ try {
     const page = await ctx.newPage();
     try {
       console.log(`[笔记 ${i + 1}/${noteList.length}] ${group.platform || '小红书'} ${group.creator} 评论x${group.comments.length} ${url.slice(0, 70)}`);
-      await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
+      // 小红书存量 URL 的 xsec_token 会过期，过期必命中失效页守卫被整页跳过、补图永不收敛。
+      // 与主引擎 collectNoteComments 同解法：回博主主页点卡片，让 XHS 带新 token 打开笔记；
+      // config 里找不到博主、拿不到笔记 ID 或卡片打开失败时，才退回裸链 goto。
+      let opened = false;
+      if (platformSlug === 'xiaohongshu') {
+        const cc = (config.creators || []).find((x) => x.name === group.creator && (x.platform || 'xiaohongshu') === 'xiaohongshu');
+        const profileUrl = cc && (cc.resolvedUrl || cc.profileUrl);
+        const noteId = (!/^https?:/.test(key) && key)
+          || (group.comments[0] && group.comments[0].noteId)
+          || (String(url).match(/\/(?:explore|discovery\/item)\/([\w-]+)/)?.[1] || '');
+        if (profileUrl && noteId) {
+          opened = await openXhsNoteViaProfile(page, profileUrl, noteId);
+          if (!opened) console.log('  ↳ 主页卡片打开失败(卡片下架或被拦)，退回裸链重试');
+        }
+      }
+      if (!opened) await page.goto(url, { waitUntil: 'domcontentloaded', timeout: 45000 });
       await sleep(rand(9000, 13000));
       const guard = await pageGuard(page, platformSlug);
       if (guard.fatal) { fatalStop = guard.reason; break; }
