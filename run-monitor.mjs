@@ -272,6 +272,14 @@ function acquireRunLock() {
 }
 
 function closeExistingProfileProcesses() {
+  // profileDir 来自 config，若被误配成过短的公共子串(如应用目录本身)，按字符串包含匹配会误杀同机无关 Chrome。
+  // 匹配前校验特异性：目录名含 chrome-profile，或绝对路径深度 >=3，否则跳过并告警。
+  const profileDirSpecific = path.basename(profileDir).includes('chrome-profile')
+    || profileDir.split(path.sep).filter(Boolean).length >= 3;
+  if (!profileDirSpecific) {
+    console.error(`[浏览器准备] profileDir(${profileDir}) 特异性不足，跳过关闭存量进程，防误杀无关 Chrome。请把 runtime.profileDir 配成专用目录。`);
+    return;
+  }
   const result = spawnSync('ps', ['-axo', 'pid=,command='], {
     encoding: 'utf8',
     maxBuffer: 10 * 1024 * 1024
