@@ -120,14 +120,15 @@ function createLocalStorage(config, { runtimeDir, dryRun, projectDir }) {
       return true;
     },
     saveVideos: (payload, shots) => {
-      if (dryRun) { console.log(`[dry-run] videos: ${payload.rows.length} rows`); return { written: payload.rows.length }; }
+      // dry-run 不写库，written 必须计 0：stats 按 written 统计「已入库」，返回行数会把计划量虚报成真实写入
+      if (dryRun) { console.log(`[dry-run] videos: ${payload.rows.length} rows`); return { written: 0 }; }
       const fields = [...payload.fields, '内容截图'];
       const rows = payload.rows.map((row, i) => ({ ...zipRow(payload.fields, row), 内容截图: rel(shots?.[i] || '') }));
       appendJsonlAndCsv(`${F.videos}.jsonl`, `${F.videos}.csv`, fields, rows);
       return { written: rows.length };
     },
     saveComments: (payload, shots) => {
-      if (dryRun) { console.log(`[dry-run] comments: ${payload.rows.length} rows`); return { written: payload.rows.length }; }
+      if (dryRun) { console.log(`[dry-run] comments: ${payload.rows.length} rows`); return { written: 0 }; }
       const fields = [...payload.fields, '评论截图'];
       const rows = payload.rows.map((row, i) => ({ ...zipRow(payload.fields, row), 评论截图: rel(shots?.[i] || '') }));
       appendJsonlAndCsv(`${F.comments}.jsonl`, `${F.comments}.csv`, fields, rows);
@@ -205,7 +206,7 @@ function createFeishuStorage(config, { runtimeDir, dryRun }) {
     if (rows.length === 0) return { written: 0, recordIds: [] };
     if (dryRun) {
       console.log(`[dry-run] ${name}: ${rows.length} rows`);
-      return { written: rows.length, recordIds: [] };
+      return { written: 0, recordIds: [] };
     }
     let written = 0;
     const recordIds = [];
