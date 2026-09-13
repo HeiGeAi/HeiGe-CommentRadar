@@ -978,6 +978,16 @@ async function main() {
       .filter((creator) => !creatorMatch || (creator.name || '').includes(creatorMatch));
     const targetCreators = limitCreators > 0 ? creators.slice(0, limitCreators) : creators;
 
+    // 过滤条件拼错(博主名打错/平台写错)会清空目标列表，无人值守下静默空跑还报「无新增」成功。
+    // 登录类操作不依赖博主清单，放行；采集/回填场景明确告警并以非零退出码结束。
+    if (targetCreators.length === 0 && !loginSetup && !loginCheck) {
+      console.error(`[配置检查] 过滤后没有可采集的博主：config 共 ${(config.creators || []).length} 个` +
+        `${onlyPlatform ? `，--only-platform=${onlyPlatform}` : ''}` +
+        `${creatorMatch ? `，--creator-match=${creatorMatch}` : ''}` +
+        `${limitCreators > 0 ? `，--limit-creators=${limitCreators}` : ''}。请检查过滤条件拼写。`);
+      process.exit(2);
+    }
+
     // 存储后端初始化：local(默认，零依赖) / feishu(绑定后完全体)。
     // 登录操作(--login-setup/--login-check)用不到去重集，跳过全量读库(feishu 逐页翻表分钟级)，
     // 不然登录窗口要白等几分钟才弹出来，用户会误判失败去重复点
