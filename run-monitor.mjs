@@ -949,30 +949,55 @@ function logRows(status, stats, failureReason) {
   };
 }
 
-function flushCreatorData(creatorName, creatorVideos, creatorComments, stats, errors) {
+function flushCreatorData(creatorName, creatorVideos, creatorComments, stats, errors, existingVideoKeys, existingCommentKeys) {
   let commentOk = 0;
   let videoOk = 0;
-  // 评论是核心产物，先写、独立 try，不被视频写库失败连坐。
-  // 截图按行序随数据交给存储层：feishu 挂附件字段，local 作为路径列写进行里，一一对应关系两边一致
+  let committedComments = new Set();
+  // A failed remote batch may have committed earlier chunks. Read durable keys
+  // before retrying, and never turn an incomplete comment write into a video marker.
+  // If reconciliation itself fails, abort rather than guessing what was committed.
+  const reconcile = (items, memoryKeys, durableKeys) => {
+    for (const item of items) {
+      if (durableKeys.has(item.uniqueKey)) memoryKeys.add(item.uniqueKey);
+      else memoryKeys.delete(item.uniqueKey);
+    }
+    return items.filter((item) => durableKeys.has(item.uniqueKey)).length;
+  };
   if (creatorComments.length > 0) {
     try {
       const cp = commentRows(creatorComments);
       const commentShots = creatorComments.map((item) => item.shotComment || '');
       commentOk = storage.saveComments(cp, commentShots).written;
-      stats.insertedComments += commentOk;
+      if (!dryRun && commentOk !== creatorComments.length) {
+        throw new Error(`评论仅确认写入 ${commentOk}/${creatorComments.length}`);
+      }
+      committedComments = new Set(creatorComments.map((item) => item.uniqueKey));
     } catch (error) {
       errors.push(`${creatorName} 评论入库失败: ${error.message}`);
+      committedComments = storage.loadCommentKeys();
+      commentOk = reconcile(creatorComments, existingCommentKeys, committedComments);
     }
+    stats.insertedComments += commentOk;
   }
-  if (creatorVideos.length > 0) {
+  const safeVideos = creatorVideos.filter((video) => creatorComments.every((item) =>
+    item.video.uniqueKey !== video.uniqueKey || committedComments.has(item.uniqueKey)));
+  const safeVideoKeys = new Set(safeVideos.map((video) => video.uniqueKey));
+  for (const video of creatorVideos) {
+    if (!safeVideoKeys.has(video.uniqueKey)) existingVideoKeys.delete(video.uniqueKey);
+  }
+  if (safeVideos.length > 0) {
     try {
-      const vp = videoRows(creatorVideos);
-      const videoShots = creatorVideos.map((video) => video.shotContent || '');
+      const vp = videoRows(safeVideos);
+      const videoShots = safeVideos.map((video) => video.shotContent || '');
       videoOk = storage.saveVideos(vp, videoShots).written;
-      stats.insertedVideos += videoOk;
+      if (!dryRun && videoOk !== safeVideos.length) {
+        throw new Error(`视频仅确认写入 ${videoOk}/${safeVideos.length}`);
+      }
     } catch (error) {
       errors.push(`${creatorName} 视频入库失败: ${error.message}`);
+      videoOk = reconcile(safeVideos, existingVideoKeys, storage.loadVideoKeys());
     }
+    stats.insertedVideos += videoOk;
   }
   if (creatorVideos.length > 0 || creatorComments.length > 0) {
     console.log(`[${creatorName}] 已入库：视频 ${videoOk}/${creatorVideos.length}，评论 ${commentOk}/${creatorComments.length}`);
@@ -1197,7 +1222,7 @@ async function main() {
             }
             // 回填逐条即时入库(崩溃只丢当前一条，可断点续抓)：评论采集失败的视频跳过不写，留待下轮
             if (backfill && !failedVideoKeys.has(video.uniqueKey)) {
-              flushCreatorData(creator.name, [video], videoComments, stats, errors);
+              flushCreatorData(creator.name, [video], videoComments, stats, errors, existingVideoKeys, existingCommentKeys);
             } else if (!backfill) {
               pendingComments.push(...videoComments);
             }
@@ -1207,9 +1232,9 @@ async function main() {
         // 非回填：本博主采完统一入库(剔除评论采集失败的视频)；回填+跳评论：只入视频
         const okVideos = creatorVideos.filter((v) => !failedVideoKeys.has(v.uniqueKey));
         if (!backfill) {
-          flushCreatorData(creator.name, okVideos, pendingComments, stats, errors);
+          flushCreatorData(creator.name, okVideos, pendingComments, stats, errors, existingVideoKeys, existingCommentKeys);
         } else if (skipComments) {
-          flushCreatorData(creator.name, okVideos, [], stats, errors);
+          flushCreatorData(creator.name, okVideos, [], stats, errors, existingVideoKeys, existingCommentKeys);
         }
 
         if (remainingVideoBudget <= 0) {
